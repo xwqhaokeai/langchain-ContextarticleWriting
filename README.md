@@ -45,7 +45,7 @@ uv config set index-url https://pypi.tuna.tsinghua.edu.cn/simple
 **d. 安装项目依赖**
 现在，你可以直接运行安装命令，`uv` 会自动使用刚才配置的镜像源。
 ```bash
-uv pip install -e .[dev]
+uv sync
 ```
 
 ### 3. 配置环境
