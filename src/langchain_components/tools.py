@@ -84,18 +84,47 @@ def save_article(filename: str, content: str, output_dir: str = "output/md") -> 
     except Exception as e: return f"Error saving article: {e}"
 
 @tool
-async def save_image_with_compression(image_url: str, filename: str, output_dir: str = "output/img") -> str:
-    """Downloads an image, compresses it, converts to PNG, and saves it."""
+async def save_image_with_compression(image_input: str | dict, filename: str, output_dir: str = "output/img") -> str:
+    """
+    Processes an image, compresses it, converts to PNG, and saves it.
+    The input can be a direct URL string, a dictionary containing an 'image_url',
+    or a dictionary from the generate_image tool containing a 'temp_file_path'.
+    """
     MAX_SIZE_BYTES = 500 * 1024
+    image_data = None
+
+    if isinstance(image_input, dict) and "temp_file_path" in image_input:
+        # New logic: Handle the "receipt" from generate_image
+        temp_path = Path(image_input["temp_file_path"])
+        if temp_path.is_file():
+            with open(temp_path, "rb") as f:
+                image_data = f.read()
+            # Clean up the temporary file
+            temp_path.unlink()
+        else:
+            return f"Error: Temporary image file not found at {temp_path}"
+    elif isinstance(image_input, dict) and "image_url" in image_input:
+        # Existing logic for URL in dict
+        url_to_fetch = image_input["image_url"]
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url_to_fetch) as response:
+                response.raise_for_status()
+                image_data = await response.read()
+    elif isinstance(image_input, str) and image_input.startswith('http'):
+        # Existing logic for direct URL string
+        url_to_fetch = image_input
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url_to_fetch) as response:
+                response.raise_for_status()
+                image_data = await response.read()
+
+    if not image_data:
+        return "Error: Invalid input. Could not find or download valid image data."
+
     try:
         save_dir = Path(output_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         file_path = save_dir / f"{filename}.png"
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(image_url) as response:
-                response.raise_for_status()
-                image_data = await response.read()
         
         img = Image.open(io.BytesIO(image_data))
         

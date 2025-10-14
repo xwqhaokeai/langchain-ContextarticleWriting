@@ -1,6 +1,8 @@
+
 import time
 import uuid
 import asyncio
+import json
 from typing import Optional
 from pathlib import Path
 
@@ -9,6 +11,7 @@ from langchain_core.messages import HumanMessage
 
 from ...config import get_settings
 from ...infrastructure.exceptions import AgentExecutionError
+from ...infrastructure.logging import get_logger
 from ...schemas import WriteRequest, WriteResponse, TranslateRequest, ImageGenerationRequest
 from ...langchain_components.agent_graph import agent_graph
 from ...langchain_components.tools import save_article, save_image_with_compression
@@ -16,6 +19,7 @@ from ...plugins.translation import translate_text
 from ...plugins.image_generation import generate_image
 
 router = APIRouter()
+logger = get_logger(__name__)
 
 @router.post("/write", response_model=WriteResponse)
 async def create_article(request: WriteRequest, x_trace_id: Optional[str] = Header(None)):
@@ -128,25 +132,21 @@ async def images_existing_article(request: ImageGenerationRequest):
     
     try:
         image_results = await asyncio.gather(*[generate_image.ainvoke({"scene_description": scene_description}) for _ in range(request.number_of_images)])
-        file_paths, image_urls = {}, []
-        save_tasks = []
-        for i, result in enumerate(image_results):
-            if "URL:" in result:
-                url = result.split("URL:")[1].strip()
-                image_urls.append(url)
-                filename = f"{source_path.stem}_image_{i}"
-                save_tasks.append(save_image_with_compression.ainvoke({"image_url": url, "filename": filename, "output_dir": "output/img_exist"}))
-        
-        save_results = await asyncio.gather(*save_tasks)
-        for res in save_results:
-            if "successfully saved to" in res:
-                path_str = res.split("successfully saved to")[1].strip()
+        file_paths = {}
+        for result in image_results:
+            if isinstance(result, dict) and "file_path" in result:
+                path_str = result["file_path"]
                 file_paths[Path(path_str).name] = path_str
+                logger.info("Successfully generated and saved image", path=path_str)
+            elif isinstance(result, dict) and "error" in result:
+                logger.error("Image generation tool returned an error", error=result.get("error"), details=result.get("details"))
+            else:
+                logger.warning("Received an unexpected result from generate_image tool", result=result)
 
         return WriteResponse(
             article_id=request.article_id, status="completed",
             processing_time=time.time() - start_time, file_paths=file_paths,
-            generated_images=image_urls, metadata={"source_file": str(source_path)}
+            metadata={"source_file": str(source_path)}
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Image generation error: {e}")

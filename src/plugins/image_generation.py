@@ -1,85 +1,164 @@
 import asyncio
-import datetime
-import hashlib
-import hmac
+import re
 import json
-import os
 from typing import Any, Dict
-from urllib.parse import quote
+import base64
+import json
+import aiohttp
+import uuid
+from pathlib import Path
 
-import requests
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
+
 from ..config import get_settings
 from ..infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
 
-class JimengDrawer:
-    def __init__(self, ak: str, sk: str):
-        self.ak, self.sk = ak, sk
-        self.host, self.region, self.service = 'visual.volcengineapi.com', 'cn-south-1', 'cv'
-        self.endpoint, self.req_key = 'https://visual.volcengineapi.com', 'jimeng_high_aes_general_v21_L'
-    def _sign(self, key, msg): return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
-    def _get_signature_key(self, key, dateStamp, regionName, serviceName):
-        kDate = self._sign(key.encode('utf-8'), dateStamp)
-        kRegion = self._sign(kDate, regionName)
-        kService = self._sign(kRegion, serviceName)
-        return self._sign(kService, 'request')
-    def _format_query(self, p): return '&'.join([f"{k}={quote(str(p[k]))}" for k in sorted(p)])
-    def _sign_v4_request(self, req_query, req_body):
-        t = datetime.datetime.utcnow()
-        current_date, datestamp = t.strftime('%Y%m%dT%H%M%SZ'), t.strftime('%Y%m%d')
-        payload_hash = hashlib.sha256(req_body.encode('utf-8')).hexdigest()
-        canonical_request = f"POST\n/\n{req_query}\ncontent-type:application/json\nhost:{self.host}\nx-content-sha256:{payload_hash}\nx-date:{current_date}\n\ncontent-type;host;x-content-sha256;x-date\n{payload_hash}"
-        credential_scope = f"{datestamp}/{self.region}/{self.service}/request"
-        string_to_sign = f"HMAC-SHA256\n{current_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
-        signing_key = self._get_signature_key(self.sk, datestamp, self.region, self.service)
-        signature = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
-        auth_header = f"HMAC-SHA256 Credential={self.ak}/{credential_scope}, SignedHeaders=content-type;host;x-content-sha256;x-date, Signature={signature}"
-        return {'X-Date': current_date, 'Authorization': auth_header, 'X-Content-Sha256': payload_hash, 'Content-Type': 'application/json'}
-    def draw(self, prompt: str, **kwargs):
-        query = self._format_query({'Action': 'CVProcess', 'Version': '2022-08-31'})
-        body = {"req_key": self.req_key, "prompt": prompt, **kwargs}
-        headers = self._sign_v4_request(query, json.dumps(body, ensure_ascii=False))
-        resp = requests.post(f'{self.endpoint}?{query}', headers=headers, data=json.dumps(body, ensure_ascii=False))
-        resp.raise_for_status()
-        return resp.json()
+
+class GeminiImageGenerator:
+    """Wrapper for Gemini image generation model using direct HTTP requests."""
+
+    def __init__(self, api_key: str, model: str, base_url: str | None):
+        self.api_key = api_key
+        self.model = model
+        if not base_url:
+            raise ValueError("base_url must be configured for GeminiImageGenerator")
+        # Note: The actual endpoint might vary based on the provider (e.g., Google AI Studio vs. Vertex AI)
+        self.endpoint_url = f"{base_url.rstrip('/')}/models/{self.model}:generateContent"
+        logger.debug(f"GeminiImageGenerator initialized for endpoint: {self.endpoint_url}")
+
+    async def draw(self, prompt: str, **kwargs: Any) -> Dict[str, Any]:
+        """Generates an image by calling the Gemini generateContent API directly."""
+        
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseModalities": ["TEXT", "IMAGE"]  # Crucial parameter based on user's working example
+            }
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+
+        logger.debug("Calling Gemini generateContent API", url=self.endpoint_url, payload=payload)
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.endpoint_url, json=payload, headers=headers) as response:
+                    response.raise_for_status()
+                    response_text = await response.text()
+                    logger.debug("Received raw response from Gemini API", status=response.status, content=response_text)
+
+                    # Use regex to find base64 data in the raw text response. This is the most robust method.
+                    # A valid base64 string for an image will be very long.
+                    base64_pattern = re.compile(r'([A-Za-z0-9+/]{200,}=*)')
+                    match = base64_pattern.search(response_text)
+                    
+                    if match:
+                        base64_data = match.group(1)
+                        logger.debug(f"Successfully extracted base64 data using regex, length: {len(base64_data)}")
+                        return {"base64_data": base64_data}
+
+                    # If regex fails, try to parse JSON for a more detailed error message
+                    try:
+                        data = json.loads(response_text)
+                        logger.error("Failed to find image data using regex.", response_content=data)
+                        return {"error": "No image data found in response", "details": data}
+                    except json.JSONDecodeError:
+                        logger.error("Failed to find image data and response is not valid JSON.", response_content=response_text)
+                        return {"error": "No image data found in response and response is not valid JSON", "details": response_text}
+
+        except Exception as e:
+            logger.error("Error calling image generation API", error=str(e))
+            details = str(e)
+            if 'response_json' in locals():
+                details = response_json
+            return {"error": "Exception during API call", "details": details}
+
 
 settings = get_settings()
-drawer_instance = JimengDrawer(settings.JIMENG_AK, settings.JIMENG_SK) if settings.JIMENG_AK and settings.JIMENG_SK else None
+image_generator_instance = GeminiImageGenerator(
+    api_key=settings.openai_api_key,
+    model="gemini-2.5-flash-image-preview",  # A model that explicitly supports vision/image tasks
+    base_url=settings.openai_api_base,
+)
 
 @tool
-async def generate_image(scene_description: str) -> str:
-    """Generates an image based on a descriptive theme or scene."""
+async def generate_image(scene_description: str) -> dict:
+    """
+    Generates an image based on a descriptive theme, saves it to a file,
+    and returns the file path for downstream processing.
+    """
     logger.info("Starting image generation", scene_description=scene_description)
-    if not drawer_instance:
-        logger.error("Image generation service not configured.")
-        return "Error: Image generation service not configured."
-    
-    llm = ChatOpenAI(
+
+    prompt_enhancer_llm = ChatOpenAI(
         model=settings.openai_model,
         temperature=settings.temperature,
         api_key=settings.openai_api_key,
         base_url=settings.openai_api_base,
     )
-    prompt_template = f'Create a detailed, artistic prompt in English for an AI image model, based on: "{scene_description}"'
+    prompt_template = (
+        'You are an expert prompt engineer for an AI image generation model. '
+        'Your task is to take a simple description and transform it into a detailed, artistic, and effective prompt in English. '
+        'The output MUST be ONLY the prompt text itself, without any surrounding text, explanations, or conversational phrases. '
+        'Do not offer choices or ask questions. '
+        f'Based on the following description, generate a single, direct image prompt:\n\n"{scene_description}"'
+    )
+
     try:
-        logger.info("Generating image prompt with LLM...")
-        response = await llm.ainvoke(prompt_template)
+        logger.info("Generating enhanced image prompt with LLM...")
+        response = await prompt_enhancer_llm.ainvoke(prompt_template)
         image_prompt = response.content.strip()
-        logger.info("Image prompt generated", image_prompt=image_prompt)
+        logger.info("Enhanced image prompt generated", image_prompt=image_prompt)
+
+        if not image_prompt or not isinstance(image_prompt, str):
+            logger.error("LLM failed to generate a valid image prompt.", original_description=scene_description)
+            return {"error": "LLM failed to generate a valid image prompt.", "details": f"Received: {image_prompt}"}
+
+        final_prompt = image_prompt
+        logger.info("Using pure enhanced English prompt for image generation", final_prompt=final_prompt)
+
+        api_response = await image_generator_instance.draw(prompt=final_prompt)
+        logger.info("Image generation API response received", response=api_response)
+
+        if "error" in api_response:
+            logger.error("Image generation failed, passing error upstream.", details=api_response)
+            return api_response
+
+        # Decode the Base64 string and save it to a file.
+        encoded_data = api_response.get('base64_data')
+        if not encoded_data:
+            logger.error("No 'base64_data' found in API response", response=api_response)
+            return {"error": "No image data found in API response"}
+
+        # Robustly decode Base64, handling potential padding issues.
+        def robust_b64decode(data_str: str) -> bytes:
+            padding = '=' * (4 - len(data_str) % 4)
+            return base64.b64decode(data_str + padding)
+
+        try:
+            image_data = robust_b64decode(encoded_data)
+        except (ValueError, TypeError, base64.binascii.Error) as e:
+            logger.error("Failed to decode Base64 string", error=str(e), data_prefix=encoded_data[:50])
+            return {"error": "Failed to decode Base64 string", "details": str(e)}
+
+        save_dir = Path("output/img_exist")
+        save_dir.mkdir(parents=True, exist_ok=True)
         
-        logger.info("Calling image generation API...")
-        api_response = await asyncio.to_thread(drawer_instance.draw, prompt=image_prompt, width=600, height=600, seed=-1, return_url=True)
+        file_path = save_dir / f"{uuid.uuid4()}.png"
+        with open(file_path, "wb") as f:
+            f.write(image_data)
         
-        if api_response and api_response.get('code') == 10000 and api_response.get('data', {}).get('image_urls'):
-            url = api_response['data']['image_urls'][0]
-            logger.info("Image generation successful", url=url)
-            return f"Image generation successful! URL: {url}"
-        
-        logger.error("Image API returned an issue", response=api_response)
-        return f"Error: Image API returned an issue. Response: {json.dumps(api_response)}"
+        logger.info(f"Image data saved to file: {file_path}")
+
+        return {
+            "message": "Image generation successful! Image saved to file.",
+            "file_path": str(file_path)
+        }
+
     except Exception as e:
-        logger.error("Error during image generation", error=str(e))
-        return f"Error during image generation: {e}"
+        logger.error("An error occurred during image generation", error=str(e))
+        return {"error": "An error occurred during image generation", "details": str(e)}
