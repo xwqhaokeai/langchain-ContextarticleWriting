@@ -7,7 +7,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
 from ..config import get_settings
-from .tools import search_and_summarize, save_article, save_image_with_compression, finish
+from .tools import search_and_summarize, save_article, read_article, save_image_with_compression, finish
 from ..plugins.image_generation import generate_image
 from ..plugins.translation import translate_text
 from ..infrastructure.logging import get_logger
@@ -15,7 +15,7 @@ from .agent_state import AgentState
 
 logger = get_logger(__name__)
 
-tools = [generate_image, translate_text, search_and_summarize, save_article, save_image_with_compression, finish]
+tools = [generate_image, translate_text, search_and_summarize, save_article, read_article, save_image_with_compression, finish]
 tool_node = ToolNode(tools)
 
 settings = get_settings()
@@ -34,13 +34,6 @@ def should_continue(state: AgentState) -> str:
         logger.warning("No tool calls found in the last message. Ending graph.")
         return "end"
     
-    tool_name = last_message.tool_calls[0]['name']
-    logger.info(f"Last tool call was to: {tool_name}")
-    if tool_name == "finish":
-        logger.info("Finish tool called. Ending graph.")
-        return "end"
-    
-    logger.info("Continuing with tool call.")
     return "call_tool"
 
 def call_model(state: AgentState):
@@ -48,7 +41,13 @@ def call_model(state: AgentState):
     messages = state['messages']
     logger.debug("Messages sent to model:", messages=messages)
     
-    response = model.invoke(messages)
+    try:
+        response = model.invoke(messages)
+    except Exception as e:
+        logger.error(f"Error calling model: {e}")
+        # Create a message to inform the user of the error
+        error_message = HumanMessage(content=f"An error occurred while calling the model: {e}")
+        return {"messages": [error_message]}
     
     logger.info("Model response received.")
     logger.debug("Model response content:", content=response.content)
@@ -85,6 +84,29 @@ workflow.add_conditional_edges(
     },
 )
 
-workflow.add_edge("action", "agent")
+def after_tool_call(state: AgentState) -> str:
+    logger.info("Checking condition: after_tool_call")
+    last_message = state['messages'][-1]
+    # The last message is a ToolMessage, which doesn't have tool_calls.
+    # We need to look at the message before it, which is the AI message with the tool call.
+    ai_message_with_tool_call = state['messages'][-2]
+    tool_name = ai_message_with_tool_call.tool_calls[0]['name']
+    
+    logger.info(f"Tool called was: {tool_name}")
+    if tool_name == "finish":
+        logger.info("Finish tool was called. Ending graph.")
+        return "end"
+    
+    logger.info("Continuing with agent.")
+    return "continue"
+
+workflow.add_conditional_edges(
+    "action",
+    after_tool_call,
+    {
+        "continue": "agent",
+        "end": END,
+    },
+)
 
 agent_graph = workflow.compile()

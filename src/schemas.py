@@ -92,3 +92,18 @@ class ImageGenerationRequest(BaseModel):
     article_id: str = Field(..., description="要生成图片的文章ID")
     source_file: Optional[str] = Field(None, description="源文件路径 (可选)")
     number_of_images: int = Field(1, gt=0)
+
+class PubMedSearchRequest(BaseModel):
+    topic: str = Field(..., description="The topic to research on PubMed.", min_length=1, max_length=500)
+    keywords: Optional[List[str]] = Field(None, description="Keywords to refine the PubMed search.")
+    max_results: Optional[int] = Field(10, description="Maximum number of articles to fetch from PubMed.")
+
+class WriteFromPubMedRequest(BaseModel):
+    article_id: str = Field(..., description="The ID of the article to be written from existing PubMed data.")
+    topic: str = Field(..., description="The main topic of the article to be written.")
+    style: Optional[str] = Field("scientific review", description="The style of the article.")
+    language: Optional[str] = Field("en", description="The language of the article.")
+    translate_to: Optional[List[str]] = Field(None, description="A list of languages to translate the article into.")
+    instructions: Optional[str] = Field(None, description="Additional user instructions for writing.")
+    focus_areas: Optional[List[str]] = Field(None, description="Areas to focus on during writing.")
+    include_references: bool = Field(True, description="Whether to include references in the article.")

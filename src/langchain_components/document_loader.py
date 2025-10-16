@@ -5,12 +5,75 @@ from langchain_core.documents import Document
 import aiohttp
 import xml.etree.ElementTree as ET
 
-class PubMedLoader(LangchainPubmedLoader):
+class PubMedLoader:
     """
-    扩展 Langchain 的 PubmedLoader 以支持异步加载和更灵活的元数据处理。
+    A custom async-native loader for PubMed articles.
     """
+    def __init__(self, query: str, max_results: int = 5):
+        self.query = query
+        self.max_results = max_results
+        self.base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+    async def _fetch_ids(self, session: aiohttp.ClientSession) -> List[str]:
+        search_url = f"{self.base_url}esearch.fcgi"
+        params = {
+            "db": "pubmed",
+            "term": self.query,
+            "retmax": self.max_results,
+            "usehistory": "y",
+            "format": "json"
+        }
+        async with session.get(search_url, params=params) as response:
+            response.raise_for_status()
+            data = await response.json()
+            return data.get("esearchresult", {}).get("idlist", [])
+
+    async def _fetch_abstracts(self, session: aiohttp.ClientSession, pubmed_ids: List[str]) -> List[Dict[str, Any]]:
+        if not pubmed_ids:
+            return []
+        fetch_url = f"{self.base_url}efetch.fcgi"
+        params = {"db": "pubmed", "id": ",".join(pubmed_ids), "rettype": "xml"}
+        async with session.get(fetch_url, params=params) as response:
+            response.raise_for_status()
+            xml_text = await response.text()
+            articles = []
+            try:
+                root = ET.fromstring(xml_text)
+                for article in root.findall(".//PubmedArticle"):
+                    pmid_node = article.find(".//PMID")
+                    pmid = pmid_node.text if pmid_node is not None else ""
+                    
+                    title_node = article.find(".//ArticleTitle")
+                    title = title_node.text if title_node is not None else "No title available"
+                    
+                    abstract_node = article.find(".//Abstract/AbstractText")
+                    abstract = abstract_node.text if abstract_node is not None else "No abstract available"
+                    
+                    articles.append({
+                        "pmid": pmid,
+                        "title": title,
+                        "abstract": abstract,
+                    })
+            except ET.ParseError:
+                pass  # Handle XML parsing errors gracefully
+            return articles
+
     async def aload(self) -> List[Document]:
-        return await asyncio.to_thread(self.load)
+        docs = []
+        async with aiohttp.ClientSession() as session:
+            ids = await self._fetch_ids(session)
+            if not ids:
+                return []
+            
+            articles_data = await self._fetch_abstracts(session, ids)
+            
+            for article in articles_data:
+                metadata = {
+                    "source": f"https://pubmed.ncbi.nlm.nih.gov/{article['pmid']}/",
+                    "title": article['title'],
+                }
+                docs.append(Document(page_content=article['abstract'], metadata=metadata))
+        return docs
 
 class PMCLoader:
     """
