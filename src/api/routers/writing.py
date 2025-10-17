@@ -235,11 +235,6 @@ async def write_from_existing(request: WriteFromPubMedRequest, x_trace_id: Optio
         f"   - {'Include references' if request.include_references else 'Do not include references'}.",
         f"3. Third, save the article using the `save_article` tool with filename '{article_id}_main' and output_dir 'output/write_exist'.",
     ]
-    if request.translate_to:
-        for lang in request.translate_to:
-            prompt_parts.append(f"4. Next, read the content of the saved article using the `read_article` tool with filename '{article_id}_main' and input_dir 'output/write_exist'.")
-            prompt_parts.append(f"5. Then, translate the article content into {lang} using the `translate_text` tool.")
-            prompt_parts.append(f"6. Finally, take the output from the previous `translate_text` step and save it using the `save_article` tool with filename '{article_id}_main_{lang}' and output_dir 'output/write_exist'.")
     prompt_parts.append(f"{len(prompt_parts)}. **Finish**: After all other steps are complete, call the `finish` tool to provide a final summary of all actions taken, including the paths to all saved files.")
     initial_prompt = "\n".join(prompt_parts)
 
@@ -273,6 +268,34 @@ async def write_from_existing(request: WriteFromPubMedRequest, x_trace_id: Optio
                 if "successfully saved to" in output:
                     path_str = output.split("successfully saved to")[1].strip()
                     file_paths[Path(path_str).name] = path_str
+
+        # Step 2: If translation is requested, handle it outside the agent
+        if request.translate_to:
+            # Construct the expected path directly, instead of relying on parsed tool output
+            main_article_path = Path(f"output/write_exist/{article_id}_main.md")
+            
+            if main_article_path.is_file():
+                with open(main_article_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+                translated_contents = await asyncio.gather(
+                    *[translate_text.ainvoke({"text": content, "target_language": lang}) for lang in request.translate_to]
+                )
+                
+                output_dir_str = "output/write_exist_trans"
+
+                for lang, translated_text in zip(request.translate_to, translated_contents):
+                    filename = f"{main_article_path.stem}_{lang}"
+                    save_result = save_article.invoke({
+                        "filename": filename,
+                        "content": translated_text,
+                        "output_dir": output_dir_str
+                    })
+                    if "successfully saved to" in save_result:
+                        path_str = save_result.split("successfully saved to")[1].strip()
+                        file_paths[Path(path_str).name] = path_str
+            else:
+                logger.warning(f"Main article file not found for translation at expected path: {main_article_path}")
 
         return WriteResponse(
             article_id=article_id, status="completed", content=final_summary,
